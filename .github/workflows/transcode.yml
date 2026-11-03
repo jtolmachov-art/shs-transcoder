@@ -1,0 +1,59 @@
+# South House Studio - Clients Zone: makes a light 720p copy of each uploaded video
+# and a thumbnail from the middle of it. Started automatically by files.southhouse.studio.
+# This file has no passwords or keys. The links it gets work for one video, for a few hours,
+# and are hidden in the logs.
+name: Light copy
+on:
+  repository_dispatch:
+    types: [transcode]
+permissions: {}
+jobs:
+  transcode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg jq >/dev/null
+      - name: Make 720p copy and thumbnail
+        run: |
+          set -euo pipefail
+          # read the job from the event file (never printed in the log)
+          BASE=$(jq -r '.client_payload.base' "$GITHUB_EVENT_PATH")
+          Q=$(jq -r '.client_payload.q' "$GITHUB_EVENT_PATH")
+          echo "::add-mask::$Q"; echo "::add-mask::$BASE"
+          SRC="$BASE/src?$Q"
+          fail() { curl -s -X POST "$BASE/fail?$Q" -o /dev/null || true; }
+          trap fail ERR
+          NET="-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_delay_max 30"
+
+          IFS=, read -r W H < <(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$SRC")
+          DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$SRC" || echo 0)
+          echo "Source ${W}x${H}, ${DUR}s"
+
+          # 720p on the short side (landscape, portrait and square), H.264 + AAC, quick start
+          ffmpeg -hide_banner -loglevel warning -stats $NET -i "$SRC" -map 0:v:0 -map '0:a:0?' \
+            -vf "scale=w='if(gte(iw,ih),-2,min(720,iw))':h='if(gte(iw,ih),min(720,ih),-2)',format=yuv420p" \
+            -c:v libx264 -preset veryfast -crf 23 -maxrate 3500k -bufsize 7000k \
+            -c:a aac -b:a 128k -ac 2 -movflags +faststart -y lite.mp4
+
+          # thumbnail: a typical (not black) frame from the middle
+          MID=$(awk -v d="$DUR" 'BEGIN{printf "%.2f", (d>0?d*0.5:1)}')
+          ffmpeg -hide_banner -loglevel error -ss "$MID" -i lite.mp4 -vf "thumbnail=120,scale=640:-2" -frames:v 1 -q:v 4 -y thumb.jpg || true
+
+          # upload in parts of 30 MB
+          curl -sf -X POST "$BASE/start?$Q" -H 'Content-Type: application/json' -d "{\"w\":$W,\"h\":$H,\"duration\":${DUR:-0}}" -o /dev/null
+          split -b 30m -d -a 4 lite.mp4 part_
+          PARTS="[]"; N=0
+          for f in part_*; do
+            N=$((N+1))
+            for try in 1 2 3 4 5; do
+              if R=$(curl -sf -X PUT --data-binary @"$f" "$BASE/part?$Q&n=$N"); then break; fi
+              echo "part $N retry $try"; sleep $((try*5))
+              [ "$try" = 5 ] && false
+            done
+            PARTS=$(jq -c --argjson p "$R" '. + [$p]' <<<"$PARTS")
+          done
+          SIZE=$(stat -c %s lite.mp4)
+          curl -sf -X POST "$BASE/done?$Q" -H 'Content-Type: application/json' -d "{\"parts\":$PARTS,\"size\":$SIZE}" -o /dev/null
+          [ -s thumb.jpg ] && curl -sf -X PUT --data-binary @thumb.jpg "$BASE/thumb?$Q" -o /dev/null || true
+          echo "Done: $N parts, $SIZE bytes"
